@@ -1,0 +1,716 @@
+import * as cdk from 'aws-cdk-lib';
+import { CfnOutput, Duration } from 'aws-cdk-lib';
+import * as aws_apigateway from 'aws-cdk-lib/aws-apigateway';
+import { MethodLoggingLevel } from 'aws-cdk-lib/aws-apigateway';
+import * as aws_asg from 'aws-cdk-lib/aws-applicationautoscaling';
+import * as aws_cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as aws_iam from 'aws-cdk-lib/aws-iam';
+import * as aws_lambda from 'aws-cdk-lib/aws-lambda';
+import * as aws_lambda_nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as aws_logs from 'aws-cdk-lib/aws-logs';
+import * as aws_waf from 'aws-cdk-lib/aws-wafv2';
+import { Construct } from 'constructs';
+import * as path from 'path';
+
+import _ from 'lodash';
+import { ChainConfigManager } from '../../lib/config/ChainConfigManager';
+import { STAGE } from '../../lib/util/stage';
+import { ROUTING_API_MAX_LATENCY_MS, SERVICE_NAME, SEV2_P99LATENCY_MS, SEV2_P90LATENCY_MS, SEV3_P99LATENCY_MS, SEV3_P90LATENCY_MS, LATENCY_ALARM_DEFAULT_PERIOD_MIN } from '../constants';
+import { AnalyticsStack } from './analytics-stack';
+import { DashboardStack } from './dashboard-stack';
+import { XPairDashboardStack } from './pair-dashboard-stack';
+
+const ALL_ALARMED_CHAINS = ChainConfigManager.getAlarmedChainIds();
+
+export class APIStack extends cdk.Stack {
+  public readonly url: CfnOutput;
+
+  constructor(
+    parent: Construct,
+    name: string,
+    props: cdk.StackProps & {
+      provisionedConcurrency: number;
+      internalApiKey?: string;
+      throttlingOverride?: string;
+      chatbotSNSArn?: string;
+      stage: STAGE;
+      envVars: Record<string, string>;
+    }
+  ) {
+    super(parent, name, props);
+    const { provisionedConcurrency, stage, chatbotSNSArn, internalApiKey } = props;
+
+    /*
+     *  API Gateway Initialization
+     */
+    const accessLogGroup = new aws_logs.LogGroup(this, `${SERVICE_NAME}APIGAccessLogs`);
+
+    const api = new aws_apigateway.RestApi(this, `${SERVICE_NAME}`, {
+      restApiName: `${SERVICE_NAME}`,
+      deployOptions: {
+        tracingEnabled: true,
+        loggingLevel: MethodLoggingLevel.ERROR,
+        accessLogDestination: new aws_apigateway.LogGroupLogDestination(accessLogGroup),
+        accessLogFormat: aws_apigateway.AccessLogFormat.jsonWithStandardFields({
+          ip: false,
+          caller: false,
+          user: false,
+          requestTime: true,
+          httpMethod: true,
+          resourcePath: true,
+          status: true,
+          protocol: true,
+          responseLength: true,
+        }),
+      },
+      defaultCorsPreflightOptions: {
+        allowOrigins: aws_apigateway.Cors.ALL_ORIGINS,
+        allowMethods: aws_apigateway.Cors.ALL_METHODS,
+      },
+    });
+
+    const WAF_IPAllowlist = new aws_waf.CfnIPSet(this, 'IPAllowlist', {
+      scope: 'REGIONAL',
+      ipAddressVersion: 'IPV4',
+      addresses: [
+        '142.154.213.230/32', // 2023-09-18 NYC Office Fiber Static IP 
+      ],
+    });
+
+    const ipThrottlingACL = new aws_waf.CfnWebACL(this, `${SERVICE_NAME}IPThrottlingACL`, {
+      defaultAction: { allow: {} },
+      scope: 'REGIONAL',
+      visibilityConfig: {
+        sampledRequestsEnabled: true,
+        cloudWatchMetricsEnabled: true,
+        metricName: `${SERVICE_NAME}IPBasedThrottling`,
+      },
+      customResponseBodies: {
+        [`${SERVICE_NAME}ThrottledResponseBody`]: {
+          contentType: 'APPLICATION_JSON',
+          content: '{"errorCode": "TOO_MANY_REQUESTS"}',
+        },
+      },
+      name: `${SERVICE_NAME}IPThrottling`,
+      rules: [
+        {
+          name: 'IPAllowRule',
+          priority: 10,
+          statement: {
+            ipSetReferenceStatement: {
+              arn: WAF_IPAllowlist.attrArn,
+            },
+          },
+          action: {
+            allow: {},
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: `IPAllowRule`,
+          },
+        },
+        {
+          name: 'IPAllowRule_CloudFlare',
+          priority: 11,
+          statement: {
+            ipSetReferenceStatement: {
+              arn: WAF_IPAllowlist.attrArn,
+              ipSetForwardedIpConfig: {
+                fallbackBehavior: 'NO_MATCH',
+                headerName: 'True-Client-IP',
+                position: 'ANY',
+              },
+            },
+          },
+          action: {
+            allow: {},
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: `IPAllowRuleCF`,
+          },
+        },
+        {
+          name: 'IPBlockRule_ExceptAPIKey',
+          priority: 20,
+          statement: {
+            rateBasedStatement: {
+              // Limit is per 5 mins, i.e. 200 requests every 5 mins
+              limit: props.throttlingOverride ? parseInt(props.throttlingOverride) : 200,
+              // API is of type EDGE so is fronted by Cloudfront as a proxy.
+              // Use the ip set in X-Forwarded-For by Cloudfront, not the regular IP
+              // which would just resolve to Cloudfronts IP.
+              aggregateKeyType: 'FORWARDED_IP',
+              forwardedIpConfig: {
+                headerName: 'X-Forwarded-For',
+                fallbackBehavior: 'MATCH',
+              },
+              scopeDownStatement: {
+                notStatement: {
+                  statement: {
+                    byteMatchStatement: {
+                      fieldToMatch: {
+                        singleHeader: {
+                          name: 'x-api-key',
+                        },
+                      },
+                      positionalConstraint: 'EXACTLY',
+                      searchString: internalApiKey,
+                      textTransformations: [
+                        {
+                          type: 'NONE',
+                          priority: 0,
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          action: {
+            block: {
+              customResponse: {
+                responseCode: 429,
+                customResponseBodyKey: `${SERVICE_NAME}ThrottledResponseBody`,
+              },
+            },
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: `${SERVICE_NAME}IPBasedThrottlingRule`,
+          },
+        },
+      ],
+    });
+
+    const region = cdk.Stack.of(this).region;
+    const apiArn = `arn:aws:apigateway:${region}::/restapis/${api.restApiId}/stages/${api.deploymentStage.stageName}`;
+
+    new aws_waf.CfnWebACLAssociation(this, `${SERVICE_NAME}IPThrottlingAssociation`, {
+      resourceArn: apiArn,
+      webAclArn: ipThrottlingACL.getAtt('Arn').toString(),
+    });
+
+    /*
+     * Lambda Initialization
+     */
+    const lambdaRole = new aws_iam.Role(this, `$LambdaRole`, {
+      assumedBy: new aws_iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        aws_iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+        aws_iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchLambdaInsightsExecutionRolePolicy'),
+        aws_iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonDynamoDBFullAccess'),
+      ],
+    });
+    const quoteLambda = new aws_lambda_nodejs.NodejsFunction(this, 'Quote', {
+      role: lambdaRole,
+      runtime: aws_lambda.Runtime.NODEJS_18_X,
+      entry: path.join(__dirname, '../../lib/handlers/index.ts'),
+      handler: 'quoteHandler',
+      memorySize: 1024,
+      bundling: {
+        minify: true,
+        sourceMap: true,
+      },
+      environment: {
+        VERSION: '12',
+        NODE_OPTIONS: '--enable-source-maps',
+        stage: props.stage,
+        ...props.envVars,
+      },
+      timeout: cdk.Duration.seconds(30),
+      logRetention: aws_logs.RetentionDays.ONE_MONTH,
+    });
+
+    const quoteLambdaAlias = new aws_lambda.Alias(this, `GetOrdersLiveAlias`, {
+      aliasName: 'live',
+      version: quoteLambda.currentVersion,
+      provisionedConcurrentExecutions: provisionedConcurrency > 0 ? provisionedConcurrency : undefined,
+    });
+
+    if (provisionedConcurrency > 0) {
+      const quoteTarget = new aws_asg.ScalableTarget(this, 'QuoteProvConcASG', {
+        serviceNamespace: aws_asg.ServiceNamespace.LAMBDA,
+        maxCapacity: provisionedConcurrency * 10,
+        minCapacity: provisionedConcurrency,
+        resourceId: `function:${quoteLambdaAlias.lambda.functionName}:${quoteLambdaAlias.aliasName}`,
+        scalableDimension: 'lambda:function:ProvisionedConcurrency',
+      });
+
+      quoteTarget.node.addDependency(quoteLambdaAlias);
+
+      quoteTarget.scaleToTrackMetric('QuoteProvConcTracking', {
+        targetValue: 0.7,
+        predefinedMetric: aws_asg.PredefinedMetric.LAMBDA_PROVISIONED_CONCURRENCY_UTILIZATION,
+      });
+    }
+
+    /* Analytics */
+    new AnalyticsStack(this, 'AnalyticsStack', {
+      quoteLambda,
+      envVars: props.envVars,
+    });
+
+    /* Dashboard */
+    new DashboardStack(this, 'DashboardStack', {
+      apiName: api.restApiName,
+      quoteLambdaName: quoteLambda.functionName,
+    });
+
+    /* Pair tracking dashboard for X */
+    new XPairDashboardStack(this, 'XPairDashboardStack', {});
+
+    /* Quote Endpoint */
+    const quoteLambdaIntegration = new aws_apigateway.LambdaIntegration(quoteLambdaAlias, {});
+    const quote = api.root.addResource('quote', {
+      defaultCorsPreflightOptions: {
+        allowOrigins: aws_apigateway.Cors.ALL_ORIGINS,
+        allowMethods: aws_apigateway.Cors.ALL_METHODS,
+      },
+    });
+    quote.addMethod('POST', quoteLambdaIntegration);
+
+    /* Alarms */
+    const apiAlarm5xxSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-5XXAlarm', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-5XX',
+      metric: api.metricServerError({
+        period: Duration.minutes(5),
+        // For this metric 'avg' represents error rate.
+        statistic: 'avg',
+      }),
+      threshold: 0.05,
+      // Beta has much less traffic so is more susceptible to transient errors.
+      evaluationPeriods: stage == STAGE.BETA ? 5 : 3,
+    });
+
+    const apiAlarm5xxSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-5XXAlarm', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-5XX',
+      metric: api.metricServerError({
+        period: Duration.minutes(5),
+        // For this metric 'avg' represents error rate.
+        statistic: 'avg',
+      }),
+      threshold: 0.03,
+      // Beta has much less traffic so is more susceptible to transient errors.
+      evaluationPeriods: stage == STAGE.BETA ? 5 : 3,
+    });
+
+    const apiAlarm4xxSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-4XXAlarm', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-4XX',
+      metric: api.metricClientError({
+        period: Duration.minutes(5),
+        statistic: 'avg',
+      }),
+      threshold: 0.95,
+      evaluationPeriods: 3,
+    });
+
+    const apiAlarm4xxSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-4XXAlarm', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-4XX',
+      metric: api.metricClientError({
+        period: Duration.minutes(5),
+        statistic: 'avg',
+      }),
+      threshold: 0.8,
+      evaluationPeriods: 3,
+    });
+
+    const apiAlarmLatencySev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-Latency', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-Latency',
+      metric: api.metricLatency({
+        period: Duration.minutes(LATENCY_ALARM_DEFAULT_PERIOD_MIN),
+        statistic: 'p90',
+      }),
+      threshold: SEV2_P90LATENCY_MS,
+      evaluationPeriods: 3,
+    });
+
+    const apiAlarmLatencySev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-Latency', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-Latency',
+      metric: api.metricLatency({
+        period: Duration.minutes(LATENCY_ALARM_DEFAULT_PERIOD_MIN),
+        statistic: 'p90',
+      }),
+      threshold: SEV3_P90LATENCY_MS,
+      evaluationPeriods: 3,
+    });
+
+    const apiAlarmLatencyP99Sev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-LatencyP99', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-LatencyP99',
+      metric: api.metricLatency({
+        period: Duration.minutes(LATENCY_ALARM_DEFAULT_PERIOD_MIN),
+        statistic: 'p99',
+      }),
+      threshold: SEV2_P99LATENCY_MS,
+      evaluationPeriods: 3,
+    });
+
+    // Alarm if URA latency is high (> SEV2_P99LATENCY_MS) and Routing API is not (< ROUTING_API_MAX_LATENCY_MS)
+    // Usually there's nothing to be done in URA when RoutingAPI latency is high
+    const apiAlarmLatencyP99WithDepsSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-LatencyP99WithDeps', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-LatencyP99WithDeps',
+      actionsEnabled: true,
+      evaluationPeriods: 3,
+      datapointsToAlarm: 3,
+      threshold: 1,
+      comparisonOperator: aws_cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      metric:
+        new aws_cloudwatch.MathExpression({
+          expression: "IF(ura_high_latency AND low_routing_api_latency, 1, 0)",
+          label: 'Latency Alarm',
+          usingMetrics: {
+            ura_high_latency: new aws_cloudwatch.MathExpression({
+              expression: `IF(overall_latency > ${SEV2_P99LATENCY_MS}, 1, 0)`,
+              label: 'Overall Latency',
+              usingMetrics: {
+                overall_latency: new aws_cloudwatch.Metric({
+                  namespace: 'AWS/ApiGateway',
+                  metricName: 'Latency',
+                  dimensionsMap: {
+                    ApiName: 'UnifiedRouting'
+                  },
+                  statistic: 'p99',
+                }),
+              },
+            }),
+            low_routing_api_latency: new aws_cloudwatch.MathExpression({
+              expression: `IF(routing_api_latency < ${ROUTING_API_MAX_LATENCY_MS}, 1, 0)`,
+              label: 'Routing API Quoter Latency',
+              usingMetrics: {
+                routing_api_latency: new aws_cloudwatch.Metric({
+                  namespace: 'Uniswap',
+                  metricName: 'RoutingApiQuoterLatency',
+                  dimensionsMap: {
+                    Service: 'UnifiedRoutingAPI'
+                  },
+                  statistic: 'p99',
+                }),
+              },
+            }),
+          },
+        }),
+    });
+
+    const apiAlarmLatencyP99Sev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-LatencyP99', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-LatencyP99',
+      metric: api.metricLatency({
+        period: Duration.minutes(LATENCY_ALARM_DEFAULT_PERIOD_MIN),
+        statistic: 'p99',
+      }),
+      threshold: SEV3_P99LATENCY_MS,
+      evaluationPeriods: 3,
+    });
+
+    // Alarm if URA latency is high (> SEV3_P99LATENCY_MS) and Routing API is not (< ROUTING_API_MAX_LATENCY_MS)
+    // Usually there's nothing to be done in URA when RoutingAPI latency is high
+    const apiAlarmLatencyP99WithDepsSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-LatencyP99WithDeps', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-LatencyP99WithDeps',
+      actionsEnabled: true,
+      evaluationPeriods: 3,
+      datapointsToAlarm: 3,
+      threshold: 1,
+      comparisonOperator: aws_cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      metric:
+        new aws_cloudwatch.MathExpression({
+          expression: "IF(ura_high_latency AND low_routing_api_latency, 1, 0)",
+          label: 'Latency Alarm',
+          usingMetrics: {
+            ura_high_latency: new aws_cloudwatch.MathExpression({
+              expression: `IF(overall_latency > ${SEV3_P99LATENCY_MS}, 1, 0)`,
+              label: 'Overall Latency',
+              usingMetrics: {
+                overall_latency: new aws_cloudwatch.Metric({
+                  namespace: 'AWS/ApiGateway',
+                  metricName: 'Latency',
+                  dimensionsMap: {
+                    ApiName: 'UnifiedRouting'
+                  },
+                  statistic: 'p99',
+                }),
+              },
+            }),
+            low_routing_api_latency: new aws_cloudwatch.MathExpression({
+              expression: `IF(routing_api_latency < ${ROUTING_API_MAX_LATENCY_MS}, 1, 0)`,
+              label: 'Routing API Quoter Latency',
+              usingMetrics: {
+                routing_api_latency: new aws_cloudwatch.Metric({
+                  namespace: 'Uniswap',
+                  metricName: 'RoutingApiQuoterLatency',
+                  dimensionsMap: {
+                    Service: 'UnifiedRoutingAPI'
+                  },
+                  statistic: 'p99',
+                }),
+              },
+            }),
+          },
+        }),
+    });
+
+    // Alarms for 200 rate being too low for each chain
+    const percent5XXByChainAlarm: cdk.aws_cloudwatch.Alarm[] = _.flatMap(ALL_ALARMED_CHAINS, (chainId) => {
+      const alarmNameSev3 = `UnifiedRoutingAPI-SEV3-5XXAlarm-ChainId-${chainId.toString()}`;
+      const alarmNameSev2 = `UnifiedRoutingAPI-SEV2-5XXAlarm-ChainId-${chainId.toString()}`;
+
+      const metric = new aws_cloudwatch.MathExpression({
+        expression: '100*(response5XX/invocations)',
+        period: Duration.minutes(5),
+        usingMetrics: {
+          invocations: new aws_cloudwatch.Metric({
+            namespace: 'Uniswap',
+            metricName: `QuoteRequestedChainId${chainId}`,
+            dimensionsMap: { Service: SERVICE_NAME },
+            unit: aws_cloudwatch.Unit.COUNT,
+            statistic: 'sum',
+          }),
+          response5XX: new aws_cloudwatch.Metric({
+            namespace: 'Uniswap',
+            metricName: `QuoteResponseChainId${chainId}Status5XX`,
+            dimensionsMap: { Service: SERVICE_NAME },
+            unit: aws_cloudwatch.Unit.COUNT,
+            statistic: 'sum',
+          }),
+        },
+      });
+
+      return [
+        new aws_cloudwatch.Alarm(this, alarmNameSev2, {
+          alarmName: alarmNameSev2,
+          metric,
+          threshold: 10,
+          evaluationPeriods: 3,
+        }),
+        new aws_cloudwatch.Alarm(this, alarmNameSev3, {
+          alarmName: alarmNameSev3,
+          metric,
+          threshold: 5,
+          evaluationPeriods: 3,
+        }),
+      ];
+    });
+
+    // Alarms for 4XX rate being too high for each chain
+    const percent4XXByChainAlarm: cdk.aws_cloudwatch.Alarm[] = _.flatMap(ALL_ALARMED_CHAINS, (chainId) => {
+      const alarmNameSev3 = `UnifiedRoutingAPI-SEV3-4XXAlarm-ChainId-${chainId.toString()}`;
+      const alarmNameSev2 = `UnifiedRoutingAPI-SEV2-4XXAlarm-ChainId-${chainId.toString()}`;
+
+      const metric = new aws_cloudwatch.MathExpression({
+        expression: '100*(response4XX/invocations)',
+        period: Duration.minutes(5),
+        usingMetrics: {
+          invocations: new aws_cloudwatch.Metric({
+            namespace: 'Uniswap',
+            metricName: `QuoteRequestedChainId${chainId}`,
+            dimensionsMap: { Service: SERVICE_NAME },
+            unit: aws_cloudwatch.Unit.COUNT,
+            statistic: 'sum',
+          }),
+          response4XX: new aws_cloudwatch.Metric({
+            namespace: 'Uniswap',
+            metricName: `QuoteResponseChainId${chainId}Status4XX`,
+            dimensionsMap: { Service: SERVICE_NAME },
+            unit: aws_cloudwatch.Unit.COUNT,
+            statistic: 'sum',
+          }),
+        },
+      });
+
+      return [
+        new aws_cloudwatch.Alarm(this, alarmNameSev2, {
+          alarmName: alarmNameSev2,
+          metric,
+          threshold: 80,
+          evaluationPeriods: 3,
+        }),
+        new aws_cloudwatch.Alarm(this, alarmNameSev3, {
+          alarmName: alarmNameSev3,
+          metric,
+          threshold: 50,
+          evaluationPeriods: 3,
+        }),
+      ];
+    });
+
+    // Alarm on calls from URA to the routing API
+    const routingAPIErrorMetric = new aws_cloudwatch.MathExpression({
+      expression: '100*(error/invocations)',
+      period: Duration.minutes(5),
+      usingMetrics: {
+        invocations: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RoutingApiQuoterRequest`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+        error: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RoutingApiQuoterErr`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+      },
+    });
+
+    const routingAPIErrorRateAlarmSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-RoutingAPI-ErrorRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-RoutingAPI-ErrorRate',
+      metric: routingAPIErrorMetric,
+      threshold: 10,
+      evaluationPeriods: 3,
+    });
+
+    const routingAPIErrorRateAlarmSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-RoutingAPI-ErrorRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-RoutingAPI-ErrorRate',
+      metric: routingAPIErrorMetric,
+      threshold: 5,
+      evaluationPeriods: 3,
+    });
+
+    // Alarm on calls from URA to the rfq service
+    const rfqAPIErrorMetric = new aws_cloudwatch.MathExpression({
+      expression: '100*(error/invocations)',
+      period: Duration.minutes(5),
+      usingMetrics: {
+        invocations: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RfqQuoterRequest`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+        error: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RfqQuoterRfqErr`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+      },
+    });
+
+    const rfqAPIErrorRateAlarmSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-RFQAPI-ErrorRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-RFQAPI-ErrorRate',
+      metric: rfqAPIErrorMetric,
+      threshold: 10,
+      evaluationPeriods: 3,
+    });
+
+    const rfqAPIErrorRateAlarmSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-RFQAPI-ErrorRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-RFQAPI-ErrorRate',
+      metric: rfqAPIErrorMetric,
+      threshold: 5,
+      evaluationPeriods: 3,
+    });
+
+    // Alarm on high rate of dropping rfq quotes due to pricing being too good comparing to SOR
+    const rfqQuoteDropMetric = new aws_cloudwatch.MathExpression({
+      expression: '100*(rfqDropped/denominator)',
+      period: Duration.minutes(5),
+      usingMetrics: {
+        rfqDropped: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RfqQuoteDropped-PriceTooGood`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+        denominator: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `HasBothRfqAndClassicQuote`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+      },
+    });
+
+    const rfqQuoteDropRateAlarmSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-RfqQuote-DropRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-RfqQuote-DropRate',
+      metric: rfqQuoteDropMetric,
+      threshold: 15,
+      evaluationPeriods: 3,
+    });
+
+    const rfqQuoteDropRateAlarmSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-RfqQuote-DropRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-RfqQuote-DropRate',
+      metric: rfqQuoteDropMetric,
+      threshold: 5,
+      evaluationPeriods: 3,
+    });
+
+    // Alarm on calls from URA to the nonce service (uniswapx service)
+    const nonceAPIErrorMetric = new aws_cloudwatch.MathExpression({
+      expression: '100*(error/invocations)',
+      period: Duration.minutes(5),
+      usingMetrics: {
+        invocations: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RfqQuoterRequest`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+        error: new aws_cloudwatch.Metric({
+          namespace: 'Uniswap',
+          metricName: `RfqQuoterNonceErr`,
+          dimensionsMap: { Service: SERVICE_NAME },
+          unit: aws_cloudwatch.Unit.COUNT,
+          statistic: 'sum',
+        }),
+      },
+    });
+
+    const nonceAPIErrorRateAlarmSev2 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV2-NonceAPI-ErrorRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV2-NonceAPI-ErrorRate',
+      metric: nonceAPIErrorMetric,
+      threshold: 10,
+      evaluationPeriods: 3,
+    });
+
+    const nonceAPIErrorRateAlarmSev3 = new aws_cloudwatch.Alarm(this, 'UnifiedRoutingAPI-SEV3-NonceAPI-ErrorRate', {
+      alarmName: 'UnifiedRoutingAPI-SEV3-NonceAPI-ErrorRate',
+      metric: nonceAPIErrorMetric,
+      threshold: 5,
+      evaluationPeriods: 3,
+    });
+
+    if (chatbotSNSArn) {
+      const chatBotTopic = cdk.aws_sns.Topic.fromTopicArn(this, 'ChatbotTopic', chatbotSNSArn);
+      apiAlarm5xxSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarm4xxSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarm5xxSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarm4xxSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarmLatencySev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarmLatencyP99WithDepsSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarmLatencySev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarmLatencyP99Sev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarmLatencyP99Sev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      apiAlarmLatencyP99WithDepsSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+
+      percent5XXByChainAlarm.forEach((alarm) => {
+        alarm.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      });
+      percent4XXByChainAlarm.forEach((alarm) => {
+        alarm.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      });
+
+      routingAPIErrorRateAlarmSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      routingAPIErrorRateAlarmSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      rfqAPIErrorRateAlarmSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      rfqAPIErrorRateAlarmSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      rfqQuoteDropRateAlarmSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      rfqQuoteDropRateAlarmSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      nonceAPIErrorRateAlarmSev2.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+      nonceAPIErrorRateAlarmSev3.addAlarmAction(new cdk.aws_cloudwatch_actions.SnsAction(chatBotTopic));
+    }
+
+    this.url = new CfnOutput(this, 'Url', {
+      value: api.url,
+    });
+  }
+}

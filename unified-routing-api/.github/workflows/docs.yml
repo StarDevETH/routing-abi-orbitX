@@ -1,0 +1,21 @@
+name: Validate docs
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate-docs:
+    name: validate-docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v2
+
+      - name: Run swagger validation
+        uses: readmeio/rdme@51a80867c45de15e2b41af0c4bd5bbc61b932804
+        with:
+          rdme: openapi:validate swagger.json

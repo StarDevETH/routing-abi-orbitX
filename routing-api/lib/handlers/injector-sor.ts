@@ -94,7 +94,7 @@ import { NEW_CACHED_ROUTES_ROLLOUT_PERCENT } from '../util/newCachedRoutesRollou
 import { TENDERLY_NEW_ENDPOINT_ROLLOUT_PERCENT } from '../util/tenderlyNewEndpointRolloutPercent'
 
 export const SUPPORTED_CHAINS: ChainId[] = [ChainId.MAINNET]
-const DEFAULT_TOKEN_LIST = 'https://gateway.ipfs.io/ipns/tokens.uniswap.org'
+const DEFAULT_TOKEN_LIST = 'https://tokens.uniswap.org'
 
 export interface RequestInjected<Router> extends BaseRInj {
   chainId: ChainId

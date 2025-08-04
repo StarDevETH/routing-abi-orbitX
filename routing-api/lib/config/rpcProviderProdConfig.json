@@ -5,7 +5,7 @@
     "latencyEvaluationSampleProb": 0,
     "healthCheckSampleProb": 0,
     "providerInitialWeights": [1],
-    "providerUrls": ["WEB3_1"],
+    "providerUrls": ["WEB3_RPC_1"],
     "providerNames": ["WEB_RPC"]
   }
 ]

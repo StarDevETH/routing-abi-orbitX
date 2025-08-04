@@ -131,8 +131,8 @@ export class RoutingCachingStack extends cdk.NestedStack {
             POOL_CACHE_GZIP_KEY: this.poolCacheGzipKey,
             ALCHEMY_QUERY_KEY: this.alchemyQueryKey ?? '',
             ALCHEMY_QUERY_KEY_2: this.alchemyQueryKey2 ?? '',
-            chainId: chainId.toString(),
-            protocol,
+            CHAIN_ID: chainId.toString(),
+            PROTOCOL: protocol,
             timeout: timeout.toString(),
           },
         }

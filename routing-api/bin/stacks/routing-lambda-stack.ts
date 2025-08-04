@@ -107,9 +107,9 @@ export class RoutingLambdaStack extends cdk.NestedStack {
       runtime: aws_lambda.Runtime.NODEJS_18_X,
       entry: path.join(__dirname, '../../lib/handlers/index.ts'),
       handler: 'quoteHandler',
-      // 04/18/2025: async routing lambda can have much longer timeout
-      timeout: cdk.Duration.seconds(18),
-      memorySize: 5120,
+      // Allow more time for initial cache warmup
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 2048,
       deadLetterQueueEnabled: true,
       bundling: {
         minify: true,
@@ -169,11 +169,9 @@ export class RoutingLambdaStack extends cdk.NestedStack {
       runtime: aws_lambda.Runtime.NODEJS_18_X,
       entry: path.join(__dirname, '../../lib/handlers/index.ts'),
       handler: 'quoteHandler',
-      // 11/8/23: URA currently calls the Routing API with a timeout of 10 seconds.
-      // Set this lambda's timeout to be slightly lower to give them time to
-      // log the response in the event of a failure on our end.
-      timeout: cdk.Duration.seconds(9),
-      memorySize: 5120,
+      // Allow more time for cold starts and graph building
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 2048,
       deadLetterQueueEnabled: true,
       bundling: {
         minify: true,

@@ -16,24 +16,7 @@ The best way to develop and test the API is to deploy your own instance to AWS.
 2. Create .env file in the root directory of the project with :
    ```
    THROTTLE_PER_FIVE_MINS = '' # Optional
-   WEB3_RPC_{CHAIN ID} = { RPC Provider}
-   # RPC Providers must be set for the following CHAIN IDs:
-   # MAINNET = 1
-   # ROPSTEN = 3
-   # RINKEBY = 4
-   # GOERLI = 5
-   # KOVAN = 42
-   # OPTIMISM = 10
-   # OPTIMISTIC_KOVAN = 69
-   # ARBITRUM_ONE = 42161
-   # ARBITRUM_RINKEBY = 421611
-   # POLYGON = 137
-   # POLYGON_MUMBAI = 80001
-   # BNB = 56
-   # BASE = 8453
-   # BLAST = 81457
-   # ZORA = 7777777
-   # ZKSYNC = 324
+   WEB3_RPC_1 = { RPC Provider for Ethereum mainnet }
    TENDERLY_USER = '' # For enabling Tenderly simulations
    TENDERLY_PROJECT = '' # For enabling Tenderly simulations
    TENDERLY_ACCESS_KEY = '' # For enabling Tenderly simulations

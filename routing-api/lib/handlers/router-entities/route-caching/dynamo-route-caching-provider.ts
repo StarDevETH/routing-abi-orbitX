@@ -85,7 +85,7 @@ export class DynamoRouteCachingProvider extends IRouteCachingProvider {
    * @protected
    */
   protected async _getBlocksToLive(cachedRoutes: CachedRoutes, _: CurrencyAmount<Currency>): Promise<number> {
-    return DEFAULT_BLOCKS_TO_LIVE_ROUTES_DB[cachedRoutes.chainId]
+    return DEFAULT_BLOCKS_TO_LIVE_ROUTES_DB[cachedRoutes.chainId] ?? 5
   }
 
   /**

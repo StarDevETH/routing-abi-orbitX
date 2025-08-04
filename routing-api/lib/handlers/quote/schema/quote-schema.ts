@@ -21,11 +21,11 @@ const Joi = BaseJoi.extend((joi) => ({
 }))
 
 export const QuoteQueryParamsJoi = Joi.object({
-  tokenInAddress: Joi.string().alphanum().max(42).required(),
+  tokenInAddress: Joi.string().pattern(new RegExp(/^0x[a-fA-F0-9]{40}$/)).required(),
   tokenInChainId: Joi.number()
     .valid(...SUPPORTED_CHAINS.values())
     .required(),
-  tokenOutAddress: Joi.string().alphanum().max(42).required(),
+  tokenOutAddress: Joi.string().pattern(new RegExp(/^0x[a-fA-F0-9]{40}$/)).required(),
   tokenOutChainId: Joi.number()
     .valid(...SUPPORTED_CHAINS.values())
     .required(),
@@ -48,7 +48,7 @@ export const QuoteQueryParamsJoi = Joi.object({
   forceCrossProtocol: Joi.boolean().optional(),
   forceMixedRoutes: Joi.boolean().optional(),
   protocols: Joi.stringArray().items(Joi.string().valid('v2', 'v3', 'v4', 'mixed')).optional(),
-  simulateFromAddress: Joi.string().alphanum().max(42).optional(),
+  simulateFromAddress: Joi.string().pattern(new RegExp(/^0x[a-fA-F0-9]{40}$/)).optional(),
   permitSignature: Joi.string().optional(),
   permitNonce: Joi.string().optional(),
   permitExpiration: Joi.number().optional(),
@@ -70,9 +70,12 @@ export const QuoteQueryParamsJoi = Joi.object({
   portionAmount: Joi.string()
     .pattern(/^[0-9]+$/)
     .optional(),
-  portionRecipient: Joi.string().alphanum().max(42).optional(),
+  portionRecipient: Joi.string().pattern(new RegExp(/^0x[a-fA-F0-9]{40}$/)).optional(),
   source: Joi.string().max(20).optional(),
-  gasToken: Joi.string().alphanum().max(42).optional(),
+  gasToken: Joi.string().pattern(new RegExp(/^0x[a-fA-F0-9]{40}$/)).optional(),
+
+  quoteId: Joi.string().optional(),
+
   cachedRoutesRouteIds: Joi.string().optional(),
   enableDebug: Joi.boolean().optional().default(false),
   hooksOptions: Joi.string().valid('NO_HOOKS', 'HOOKS_ONLY', 'HOOKS_INCLUSIVE').optional(),
@@ -116,7 +119,7 @@ export type QuoteQueryParams = {
   portionRecipient?: string
   source?: string
   gasToken?: string
-  quotedId?: string
+  quoteId?: string
   cachedRoutesRouteIds?: string
   enableDebug?: boolean
   hooksOptions?: HooksOptions

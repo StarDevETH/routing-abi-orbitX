@@ -1,5 +1,6 @@
 import { expect } from '@jest/globals'
 import { QuoteHandler } from '../../../../lib/handlers/quote/quote'
+import { QuoteQueryParamsJoi } from '../../../../lib/handlers/quote/schema/quote-schema'
 import { ChainId } from '@uniswap/sdk-core'
 import { Protocol } from '@uniswap/router-sdk'
 import { UniversalRouterVersion } from '@uniswap/universal-router-sdk'
@@ -113,6 +114,33 @@ describe('QuoteHandler', () => {
           undefined
         )
       ).toEqual([Protocol.V4])
+    })
+  })
+
+  describe('QuoteQueryParamsJoi address validation', () => {
+    const validAddress = '0x0000000000000000000000000000000000000000'
+    const baseParams = {
+      tokenInAddress: validAddress,
+      tokenInChainId: ChainId.MAINNET,
+      tokenOutAddress: validAddress,
+      tokenOutChainId: ChainId.MAINNET,
+      amount: '100',
+      type: 'exactIn',
+    }
+
+    const invalidAddress = '0x123'
+    const fields = [
+      'tokenInAddress',
+      'tokenOutAddress',
+      'simulateFromAddress',
+      'portionRecipient',
+      'gasToken',
+    ] as const
+
+    it.each(fields)('rejects invalid %s', (field) => {
+      const params: any = { ...baseParams, [field]: invalidAddress }
+      const { error } = QuoteQueryParamsJoi.validate(params)
+      expect(error).toBeTruthy()
     })
   })
 })

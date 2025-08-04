@@ -14,8 +14,18 @@ export function chainIdToNetworkName(networkId: ChainId): string {
       return 'smartchain'
     case ChainId.CELO:
       return 'celo'
+    case ChainId.CELO_ALFAJORES:
+      return 'celo-alfajores'
     case ChainId.AVALANCHE:
-      return 'avalanchec'
+      return 'avalanche'
+    case ChainId.SEPOLIA:
+      return 'sepolia'
+    case ChainId.BLAST:
+      return 'blast'
+    case ChainId.ZORA:
+      return 'zora'
+    case ChainId.ZKSYNC:
+      return 'zksync'
     case ChainId.BASE:
       return 'base'
     case ChainId.WORLDCHAIN:
@@ -40,6 +50,10 @@ export function generateProviderUrl(key: string, value: string, chainId: number)
     // UNIRPC_0 is a special case for the Uniswap RPC
     // - env value will contain the generic unirpc endpoint - no trailing '/'
     return `${value}/rpc/${chainId}`
+  }
+
+  if (key.startsWith('WEB3_RPC_')) {
+    return value
   }
 
   const tokens = value.split(',')
